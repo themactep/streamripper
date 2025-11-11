@@ -206,7 +206,7 @@ def main():
         return 1
     except Exception as e:
         print(f"✗ Error during analysis: {e}")
-        if args.debug_log:
+        if not args.no_debug_log:
             import traceback
             traceback.print_exc()
         return 1
