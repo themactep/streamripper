@@ -3,13 +3,15 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 
+
 def generate_combined_chart(output_dir, data, timestamp_prefix):
     """Generates a combined chart showing frame sizes and separate audio/video time drifts."""
     fig, ax1 = plt.subplots(figsize=(16, 9))
 
-    # Separate video and audio data
     video_data = data[data['Type'].isin(['I', 'P', 'B'])]
     audio_data = data[data['Type'] == 'A']
+    subtitle_data = data[data['Type'] == 'S']
+    sei_data = data[data['Has SEI'] == True]
 
     # Frame Size Plot (Primary Y-axis)
     ax1.set_xlabel('Packet Number')
@@ -23,6 +25,10 @@ def generate_combined_chart(output_dir, data, timestamp_prefix):
         ax1.plot(audio_data['Packet'], audio_data['Packet Size (bytes)'] / 1024,
                 color='lightblue', alpha=0.4, label='Audio Packet Size', linestyle='-', marker='None')
 
+    if not subtitle_data.empty:
+        ax1.scatter(subtitle_data['Packet'], subtitle_data['Packet Size (bytes)'] / 1024,
+                   color='purple', alpha=0.7, label='Subtitle Packets', s=20, marker='s')
+
     ax1.tick_params(axis='y', labelcolor='blue')
     ax1.grid(True)
 
@@ -30,28 +36,28 @@ def generate_combined_chart(output_dir, data, timestamp_prefix):
     ax2 = ax1.twinx()
     ax2.set_ylabel('Time Drift (ms)', color='red')
 
-    # Plot video drift in red
     if not video_data.empty:
         ax2.plot(video_data['Packet'], video_data['Drift (ms)'],
                 color='red', alpha=0.8, label='Video Time Drift', linestyle='-', linewidth=2)
 
-    # Plot audio drift in orange
     if not audio_data.empty:
         ax2.plot(audio_data['Packet'], audio_data['Drift (ms)'],
                 color='orange', alpha=0.8, label='Audio Time Drift', linestyle='--', linewidth=2)
 
     ax2.tick_params(axis='y', labelcolor='red')
 
-    # Set Y-axis limits for drift
     all_drifts = data['Drift (ms)'].dropna()
     if not all_drifts.empty:
         min_drift, max_drift = all_drifts.min(), all_drifts.max()
         drift_range = max_drift - min_drift
         ax2.set_ylim(min_drift - drift_range * 0.1, max_drift + drift_range * 0.1)
 
+    if not sei_data.empty:
+        for _, row in sei_data.iterrows():
+            ax1.axvline(x=row['Packet'], color='green', alpha=0.3, linestyle=':', linewidth=1)
+
     fig.suptitle(f'Stream Analysis - Frame Sizes & Time Drifts', fontsize=16)
 
-    # Combine legends from both axes
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax2.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
@@ -66,15 +72,15 @@ def generate_comprehensive_chart(output_dir, data, timestamp_prefix):
     """Generates a comprehensive chart showing all packets with separate audio/video drift lines."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
 
-    # Separate video and audio data
     video_data = data[data['Type'].isin(['I', 'P', 'B'])]
     audio_data = data[data['Type'] == 'A']
+    subtitle_data = data[data['Type'] == 'S']
+    sei_data = data[data['Has SEI'] == True]
 
     # Top subplot: Packet Sizes
     ax1.set_ylabel('Packet Size (KB)', color='black')
 
     if not video_data.empty:
-        # Color video frames by type
         i_frames = video_data[video_data['Type'] == 'I']
         p_frames = video_data[video_data['Type'] == 'P']
         b_frames = video_data[video_data['Type'] == 'B']
@@ -93,6 +99,14 @@ def generate_comprehensive_chart(output_dir, data, timestamp_prefix):
         ax1.scatter(audio_data['Packet'], audio_data['Packet Size (bytes)'] / 1024,
                    color='orange', alpha=0.5, label='Audio packets', s=10, marker='x')
 
+    if not subtitle_data.empty:
+        ax1.scatter(subtitle_data['Packet'], subtitle_data['Packet Size (bytes)'] / 1024,
+                   color='purple', alpha=0.7, label='Subtitle packets', s=25, marker='s')
+
+    if not sei_data.empty:
+        for _, row in sei_data.iterrows():
+            ax1.axvline(x=row['Packet'], color='green', alpha=0.25, linestyle=':', linewidth=1)
+
     ax1.grid(True, alpha=0.3)
     ax1.legend(loc='upper right')
     ax1.set_title(f'Stream Analysis - Packet Sizes and Time Drifts\nRun at: {timestamp_prefix}', fontsize=14)
@@ -101,27 +115,27 @@ def generate_comprehensive_chart(output_dir, data, timestamp_prefix):
     ax2.set_xlabel('Packet Number')
     ax2.set_ylabel('Time Drift (ms)', color='black')
 
-    # Plot video drift as a line
     if not video_data.empty:
         ax2.plot(video_data['Packet'], video_data['Drift (ms)'],
                 color='red', alpha=0.8, label='Video Time Drift', linestyle='-', linewidth=2)
 
-    # Plot audio drift as a line
     if not audio_data.empty:
         ax2.plot(audio_data['Packet'], audio_data['Drift (ms)'],
                 color='orange', alpha=0.8, label='Audio Time Drift', linestyle='--', linewidth=2)
 
+    if not subtitle_data.empty:
+        ax2.scatter(subtitle_data['Packet'], subtitle_data['Drift (ms)'],
+                   color='purple', alpha=0.7, label='Subtitle Drift', s=20, marker='s')
+
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc='upper right')
 
-    # Set Y-axis limits for drift
     all_drifts = data['Drift (ms)'].dropna()
     if not all_drifts.empty:
         min_drift, max_drift = all_drifts.min(), all_drifts.max()
         drift_range = max_drift - min_drift
         ax2.set_ylim(min_drift - drift_range * 0.1, max_drift + drift_range * 0.1)
 
-    # Add zero line for reference
     ax2.axhline(y=0, color='gray', linestyle=':', alpha=0.5, label='Zero drift')
 
     plt.tight_layout()

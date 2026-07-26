@@ -4,38 +4,36 @@ import time
 import os
 import re
 import pandas as pd
-import subprocess
-import threading
 from datetime import datetime
 from collections import Counter
+from dataclasses import dataclass
 
-def _capture_stream_ffmpeg(rtsp_url, output_file, duration):
-    """
-    Capture RTSP stream using FFmpeg in a separate process.
-    Saves to MP4 container which preserves timestamps and structure.
+@dataclass
+class PacketInfo:
+    __slots__ = ['type', 'wall_clock', 'stream_offset', 'packet_number', 'timestamp', 'size', 'drift', 'sei_metadata', 'subtitle_data']
+    type: str
+    wall_clock: float
+    stream_offset: int
+    packet_number: int
+    timestamp: float
+    size: int
+    drift: float
+    sei_metadata: str
+    subtitle_data: str
 
-    Args:
-        rtsp_url (str): RTSP URL
-        output_file (str): Output file path
-        duration (int): Duration in seconds
-    """
-    try:
-        cmd = [
-            'ffmpeg',
-            '-rtsp_transport', 'tcp',
-            '-i', rtsp_url,
-            '-t', str(duration),
-            '-c', 'copy',
-            '-f', 'mp4',
-            output_file
-        ]
+@dataclass
+class CorruptedPacketInfo:
+    __slots__ = ['packet_index', 'stream_offset', 'timestamp', 'size', 'error', 'error_type', 'frame_type', 'packet_data']
+    packet_index: int
+    stream_offset: int
+    timestamp: any
+    size: int
+    error: str
+    error_type: str
+    frame_type: str
+    packet_data: bytes
 
-        # Run FFmpeg in subprocess
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=duration + 60)
-    except subprocess.TimeoutExpired:
-        pass  # Expected
-    except Exception as e:
-        print(f"Warning: FFmpeg capture failed: {e}")
+
 
 def _get_h264_frame_type(packet_data):
     """
@@ -106,6 +104,36 @@ def _get_h264_frame_type(packet_data):
     except Exception as e:
         return (f"Error detecting frame type: {e}", None, -1)
 
+def _scan_h264_sei_nal_units(packet_data):
+    sei_nal_units = []
+    i = 0
+    while i < len(packet_data) - 3:
+        if packet_data[i:i+4] == b'\x00\x00\x00\x01':
+            start = i
+            nal_start = i + 4
+            i = nal_start
+        elif packet_data[i:i+3] == b'\x00\x00\x01':
+            start = i
+            nal_start = i + 3
+            i = nal_start
+        else:
+            i += 1
+            continue
+
+        if nal_start >= len(packet_data):
+            break
+
+        nal_type = packet_data[nal_start] & 0x1F
+        if nal_type == 6:
+            end = len(packet_data)
+            for j in range(i, len(packet_data) - 3):
+                if packet_data[j:j+4] == b'\x00\x00\x00\x01' or packet_data[j:j+3] == b'\x00\x00\x01':
+                    end = j
+                    break
+            sei_nal_units.append((start, end))
+
+    return sei_nal_units
+
 def _save_hex_dump(hex_dump_dir, stream_offset, packet_data, frame_type_info=None):
     """
     Save packet data as hex dump and binary files for forensic analysis.
@@ -172,11 +200,8 @@ def sanitize_url_for_filename(url):
     # Remove credentials (everything between :// and @)
     url_no_creds = re.sub(r"://.*?@", "://", url)
 
-    # Remove protocol prefix
-    url_no_protocol = re.sub(r".*://", "", url_no_creds)
-
     # Replace all non-alphanumeric characters with underscores
-    sanitized = re.sub(r'[^a-zA-Z0-9]', '_', url_no_protocol)
+    sanitized = re.sub(r'[^a-zA-Z0-9]', '_', url_no_creds)
 
     # Remove multiple consecutive underscores
     sanitized = re.sub(r'_+', '_', sanitized)
@@ -229,66 +254,12 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
     audio_stream = None
     if container.streams.audio:
         audio_stream = container.streams.audio[0]
+    subtitle_stream = None
+    if container.streams.subtitles:
+        subtitle_stream = container.streams.subtitles[0]
 
 
 
-    # Set up stream saving if requested
-    # Save raw bitstream without muxing to preserve original data
-    stream_file = None
-    stream_filename = None
-    hex_dump_dir = None
-    if save_stream:
-        # Determine codec and file extension
-        video_codec = video_stream.codec_context.name
-        if video_codec == 'h264':
-            stream_filename = os.path.join(stream_output_dir, "stream.h264")
-        elif video_codec == 'hevc':
-            stream_filename = os.path.join(stream_output_dir, "stream.h265")
-        else:
-            stream_filename = os.path.join(stream_output_dir, f"stream.{video_codec}")
-
-        try:
-            stream_file = open(stream_filename, 'wb')
-            print(f"Stream will be saved to: {stream_filename}")
-        except Exception as e:
-            print(f"Warning: Could not create output file for stream saving: {e}")
-            save_stream = False
-            stream_file = None
-
-    # Set up hex dump directory for corrupted frames if forensic mode enabled
-    if forensic_mode:
-        hex_dump_dir = os.path.join(stream_output_dir, "corrupted_frames")
-        try:
-            os.makedirs(hex_dump_dir, exist_ok=True)
-        except Exception as e:
-            print(f"Warning: Could not create corrupted frames directory: {e}")
-            hex_dump_dir = None
-
-    # Capture raw stream using FFmpeg first (video + audio, no re-encoding)
-    # This gives us the exact stream that we can then parse
-    raw_stream_temp = os.path.join(stream_output_dir, ".stream_temp.mkv")
-    if save_stream:
-        print(f"Capturing raw stream (video + audio) to temporary file...")
-        try:
-            subprocess.run(
-                [
-                    'ffmpeg',
-                    '-rtsp_transport', 'tcp',
-                    '-i', rtsp_url,
-                    '-t', str(duration),
-                    '-vcodec', 'copy',
-                    '-acodec', 'copy',
-                    '-bsf:v', 'h264_mp4toannexb',
-                    raw_stream_temp
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=duration + 60
-            )
-            print(f"✓ Raw stream captured ({os.path.getsize(raw_stream_temp)} bytes)")
-        except Exception as e:
-            print(f"Warning: FFmpeg capture failed: {e}")
-            raw_stream_temp = None
 
     # Set up raw stream saving (complete unaltered binary from camera)
     raw_stream_file = None
@@ -323,6 +294,43 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
             print(f"Warning: Could not create video stream file: {e}")
             video_stream_file = None
 
+    # Also save audio-only stream for reference
+    audio_stream_file = None
+    audio_stream_filename = None
+    if save_stream and audio_stream:
+        audio_codec = audio_stream.codec_context.name
+        audio_stream_filename = os.path.join(stream_output_dir, f"stream.{audio_codec}")
+        try:
+            audio_stream_file = open(audio_stream_filename, 'wb')
+            print(f"Audio stream will be saved to: {audio_stream_filename}")
+        except Exception as e:
+            print(f"Warning: Could not create audio stream file: {e}")
+            audio_stream_file = None
+
+    # Also save subtitle stream for reference
+    subtitle_stream_file = None
+    subtitle_stream_filename = None
+    if save_stream and subtitle_stream:
+        subtitle_stream_filename = os.path.join(stream_output_dir, "stream.sub")
+        try:
+            subtitle_stream_file = open(subtitle_stream_filename, 'wb')
+            print(f"Subtitle stream will be saved to: {subtitle_stream_filename}")
+        except Exception as e:
+            print(f"Warning: Could not create subtitle stream file: {e}")
+            subtitle_stream_file = None
+
+    # Also save SEI NAL units as a separate stream
+    sei_stream_file = None
+    sei_stream_filename = None
+    if save_stream:
+        sei_stream_filename = os.path.join(stream_output_dir, "stream.sei")
+        try:
+            sei_stream_file = open(sei_stream_filename, 'wb')
+            print(f"SEI data will be saved to: {sei_stream_filename}")
+        except Exception as e:
+            print(f"Warning: Could not create SEI stream file: {e}")
+            sei_stream_file = None
+
 
 
     packets = []
@@ -351,16 +359,21 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
     first_pts = None
     first_audio_wall_time = None
     first_audio_pts = None
+    first_subtitle_wall_time = None
+    first_subtitle_pts = None
 
     streams_to_demux = [video_stream]
     if audio_stream:
         streams_to_demux.append(audio_stream)
+    if subtitle_stream:
+        streams_to_demux.append(subtitle_stream)
 
     # Track stream offsets
     # For video: use actual offset from PyAV (when we save to file)
     # For audio: calculate based on last known video offset + accumulated audio sizes
     last_video_offset = 0
-    audio_offset_accumulator = 0  # Accumulate audio sizes between video packets
+    audio_offset_accumulator = 0
+    subtitle_offset_accumulator = 0
 
     for packet in container.demux(streams_to_demux):
         if (time.time() - start_time) > duration:
@@ -383,21 +396,49 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 try:
                     packet_bytes = bytes(packet)
                     video_stream_file.write(packet_bytes)
-                    # Update last video offset for next audio packets
-                    last_video_offset = packet_stream_offset + len(packet_bytes)
-                    audio_offset_accumulator = 0  # Reset audio accumulator
                 except Exception as e:
                     # Continue analysis even if saving fails
                     pass
+
+            # Update last video offset for next audio packets
+            last_video_offset = packet_stream_offset + packet.size
+            audio_offset_accumulator = 0
+            subtitle_offset_accumulator = 0
         elif packet.stream.type == 'audio':
-            # Audio packet: calculate offset based on last video offset + accumulated audio
             packet_stream_offset = last_video_offset + audio_offset_accumulator
 
-            # Accumulate this audio packet size for next audio packets
+            if save_stream and audio_stream_file:
+                try:
+                    packet_bytes = bytes(packet)
+                    audio_stream_file.write(packet_bytes)
+                except Exception:
+                    pass
+
             audio_offset_accumulator += packet.size
+        elif packet.stream.type == 'subtitle':
+            packet_stream_offset = last_video_offset + audio_offset_accumulator + subtitle_offset_accumulator
+
+            if save_stream and subtitle_stream_file:
+                try:
+                    packet_bytes = bytes(packet)
+                    subtitle_stream_file.write(packet_bytes)
+                except Exception:
+                    pass
+
+            subtitle_offset_accumulator += packet.size
 
         if packet.stream.type == 'video':
             frames = []
+            packet_bytes = bytes(packet)
+            frame_type_info = _get_h264_frame_type(packet_bytes)
+            frame_type_str = frame_type_info[0]
+            sei_nal_offsets = _scan_h264_sei_nal_units(packet_bytes)
+            sei_raw = b''.join(packet_bytes[lo:hi] for lo, hi in sei_nal_offsets) if sei_nal_offsets else b''
+            if sei_nal_offsets and save_stream and sei_stream_file:
+                try:
+                    sei_stream_file.write(sei_raw)
+                except Exception:
+                    pass
             try:
                 frames = list(packet.decode())
             except (av.InvalidDataError, av.EOFError, av.ExternalError,
@@ -405,20 +446,16 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 # Capture PyAV-specific corruption and decoding errors
                 if forensic_mode:
                     packet_index = len(packets) + len(corrupted_packets)
-                    packet_bytes = bytes(packet)
-                    frame_type_info = _get_h264_frame_type(packet_bytes)
-                    frame_type_str = frame_type_info[0]  # Just the string for the dict
-                    corrupted_packets.append({
-                        'packet_index': packet_index,
-                        'stream_offset': packet_stream_offset,
-                        'timestamp': packet.pts if packet.pts else 'unknown',
-                        'size': packet.size,
-                        'error': str(decode_error),
-                        'error_type': type(decode_error).__name__,
-                        'frame_type': frame_type_str,
-                        'packet_data': packet_bytes
-                    })
-                    # Save hex dump of corrupted packet
+                    corrupted_packets.append(CorruptedPacketInfo(
+                        packet_index=packet_index,
+                        stream_offset=packet_stream_offset,
+                        timestamp=packet.pts if packet.pts else 'unknown',
+                        size=packet.size,
+                        error=str(decode_error),
+                        error_type=type(decode_error).__name__,
+                        frame_type=frame_type_str,
+                        packet_data=packet_bytes
+                    ))
                     if hex_dump_dir and packet_stream_offset >= 0:
                         _save_hex_dump(hex_dump_dir, packet_stream_offset, packet_bytes, frame_type_info)
                 continue
@@ -426,19 +463,16 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 # Catch other FFmpeg errors
                 if forensic_mode:
                     packet_index = len(packets) + len(corrupted_packets)
-                    packet_bytes = bytes(packet)
-                    frame_type_info = _get_h264_frame_type(packet_bytes)
-                    frame_type_str = frame_type_info[0]
-                    corrupted_packets.append({
-                        'packet_index': packet_index,
-                        'stream_offset': packet_stream_offset,
-                        'timestamp': packet.pts if packet.pts else 'unknown',
-                        'size': packet.size,
-                        'error': str(decode_error),
-                        'error_type': type(decode_error).__name__,
-                        'frame_type': frame_type_str,
-                        'packet_data': packet_bytes
-                    })
+                    corrupted_packets.append(CorruptedPacketInfo(
+                        packet_index=packet_index,
+                        stream_offset=packet_stream_offset,
+                        timestamp=packet.pts if packet.pts else 'unknown',
+                        size=packet.size,
+                        error=str(decode_error),
+                        error_type=type(decode_error).__name__,
+                        frame_type=frame_type_str,
+                        packet_data=packet_bytes
+                    ))
                     # Save hex dump of corrupted packet
                     if hex_dump_dir and packet_stream_offset >= 0:
                         _save_hex_dump(hex_dump_dir, packet_stream_offset, packet_bytes, frame_type_info)
@@ -447,19 +481,16 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 # Catch other unexpected errors
                 if forensic_mode:
                     packet_index = len(packets) + len(corrupted_packets)
-                    packet_bytes = bytes(packet)
-                    frame_type_info = _get_h264_frame_type(packet_bytes)
-                    frame_type_str = frame_type_info[0]
-                    corrupted_packets.append({
-                        'packet_index': packet_index,
-                        'stream_offset': packet_stream_offset,
-                        'timestamp': packet.pts if packet.pts else 'unknown',
-                        'size': packet.size,
-                        'error': str(decode_error),
-                        'error_type': type(decode_error).__name__,
-                        'frame_type': frame_type_str,
-                        'packet_data': packet_bytes
-                    })
+                    corrupted_packets.append(CorruptedPacketInfo(
+                        packet_index=packet_index,
+                        stream_offset=packet_stream_offset,
+                        timestamp=packet.pts if packet.pts else 'unknown',
+                        size=packet.size,
+                        error=str(decode_error),
+                        error_type=type(decode_error).__name__,
+                        frame_type=frame_type_str,
+                        packet_data=packet_bytes
+                    ))
                     # Save hex dump of corrupted packet
                     if hex_dump_dir and packet_stream_offset >= 0:
                         _save_hex_dump(hex_dump_dir, packet_stream_offset, packet_bytes, frame_type_info)
@@ -467,28 +498,25 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
 
             # Check if frames were actually decoded (forensic check)
             if forensic_mode and len(frames) == 0 and packet.size > 0:
-                # Packet had data but produced no frames - likely corruption
+                # Packet had data but produced no decoded frames - likely corruption
                 packet_index = len(packets) + len(corrupted_packets)
-                packet_bytes = bytes(packet)
-                frame_type_info = _get_h264_frame_type(packet_bytes)
-                frame_type_str = frame_type_info[0]
-                corrupted_packets.append({
-                    'packet_index': packet_index,
-                    'stream_offset': packet_stream_offset,
-                    'timestamp': packet.pts if packet.pts else 'unknown',
-                    'size': packet.size,
-                    'error': 'Packet produced no decoded frames',
-                    'error_type': 'NoFramesDecoded',
-                    'frame_type': frame_type_str,
-                    'packet_data': packet_bytes
-                })
+                corrupted_packets.append(CorruptedPacketInfo(
+                    packet_index=packet_index,
+                    stream_offset=packet_stream_offset,
+                    timestamp=packet.pts if packet.pts else 'unknown',
+                    size=packet.size,
+                    error=str(decode_error),
+                    error_type=type(decode_error).__name__,
+                    frame_type=frame_type_str,
+                    packet_data=packet_bytes
+                ))
+
                 # Save hex dump of corrupted packet
                 if hex_dump_dir and packet_stream_offset >= 0:
                     _save_hex_dump(hex_dump_dir, packet_stream_offset, packet_bytes, frame_type_info)
 
             for frame in frames:
                 if frame.pts is None:
-                    print(f"Warning: Frame {len(packets)} has no PTS. Skipping.")
                     continue
                 
                 current_wall_time = time.time()
@@ -508,15 +536,19 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 # Convert wall clock time to milliseconds for consistency
                 wall_clock_ms = current_wall_time * 1000
 
-                packets.append({
-                    'type': frame_type,
-                    'wall_clock': wall_clock_ms,
-                    'stream_offset': packet_stream_offset,
-                    'packet_number': len(packets),
-                    'timestamp': timestamp,
-                    'size': packet.size,
-                    'drift': drift
-                })
+                packet_num = len(packets)
+                packets.append(PacketInfo(
+                    type=frame_type,
+                    wall_clock=wall_clock_ms,
+                    stream_offset=packet_stream_offset,
+                    packet_number=packet_num,
+                    timestamp=timestamp,
+                    size=packet.size,
+                    drift=drift,
+                    sei_metadata=sei_raw.hex() if sei_nal_offsets else "",
+                    subtitle_data=""
+                ))
+
 
                 if log_file:
                     packet_num = len(packets)
@@ -538,34 +570,75 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
                 # Convert wall clock time to milliseconds for consistency
                 audio_wall_clock_ms = current_audio_wall_time * 1000
 
-                packets.append({
-                    'type': 'A',
-                    'wall_clock': audio_wall_clock_ms,
-                    'stream_offset': packet_stream_offset,  # Cumulative offset in interleaved stream
-                    'packet_number': len(packets),
-                    'timestamp': timestamp,
-                    'size': packet.size,
-                    'drift': drift
-                })
+                packet_num = len(packets)
+                packets.append(PacketInfo(
+                    type='A',
+                    wall_clock=audio_wall_clock_ms,
+                    stream_offset=packet_stream_offset,
+                    packet_number=packet_num,
+                    timestamp=timestamp,
+                    size=packet.size,
+                    drift=drift,
+                    sei_metadata="",
+                    subtitle_data=""
+                ))
+
 
                 if log_file:
                     packet_num = len(packets)
                     log_file.write(f"{audio_wall_clock_ms:.2f},0x{packet_stream_offset:08x},{packet_stream_offset},{packet_num},A,{packet.size},{timestamp:.2f},{drift:.2f}\n")
+        elif packet.stream.type == 'subtitle':
+            if packet.pts is not None:
+                current_subtitle_wall_time = time.time()
+                if first_subtitle_wall_time is None:
+                    first_subtitle_wall_time = current_subtitle_wall_time
+
+                timestamp = packet.pts * subtitle_stream.time_base * 1000
+                if first_subtitle_pts is None:
+                    first_subtitle_pts = timestamp
+
+                relative_timestamp = timestamp - first_subtitle_pts
+                expected_time = first_subtitle_wall_time + relative_timestamp / 1000.0
+                drift = (current_subtitle_wall_time - expected_time) * 1000
+
+                subtitle_wall_clock_ms = current_subtitle_wall_time * 1000
+
+                subtitle_text = ""
+                try:
+                    subtitle_frames = list(packet.decode())
+                    for sf in subtitle_frames:
+                        if hasattr(sf, 'ass_encoded') and sf.ass_encoded:
+                            subtitle_text += sf.ass_encoded + "\n"
+                        elif hasattr(sf, 'text') and sf.text:
+                            subtitle_text += sf.text + "\n"
+                except Exception:
+                    pass
+
+                packet_num = len(packets)
+                packets.append(PacketInfo(
+                    type='S',
+                    wall_clock=subtitle_wall_clock_ms,
+                    stream_offset=packet_stream_offset,
+                    packet_number=packet_num,
+                    timestamp=timestamp,
+                    size=packet.size,
+                    drift=drift,
+                    sei_metadata="",
+                    subtitle_data=subtitle_text.strip()
+                ))
+
+                if log_file:
+                    packet_num = len(packets)
+                    log_file.write(f"{subtitle_wall_clock_ms:.2f},0x{packet_stream_offset:08x},{packet_stream_offset},{packet_num},S,{packet.size},{timestamp:.2f},{drift:.2f}\n")
 
     end_time = time.time()
     actual_duration = end_time - start_time
-
-    # Clean up temporary stream file
-    if raw_stream_temp and os.path.exists(raw_stream_temp):
-        try:
-            os.remove(raw_stream_temp)
-        except Exception as e:
-            print(f"Warning: Could not remove temporary file: {e}")
 
     # Close stream files
     if log_file:
         log_file.close()
         print(f"Flow data saved to {os.path.join(stream_output_dir, 'flow.csv')}")
+
 
     if save_stream and raw_stream_file:
         try:
@@ -583,13 +656,38 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         except Exception as e:
             print(f"Warning: Error closing video stream file: {e}")
 
+    if save_stream and audio_stream_file:
+        try:
+            audio_stream_file.close()
+            file_size = os.path.getsize(audio_stream_filename)
+            print(f"✓ Audio stream saved successfully! ({file_size} bytes)")
+        except Exception as e:
+            print(f"Warning: Error closing audio stream file: {e}")
+
+    if save_stream and subtitle_stream_file:
+        try:
+            subtitle_stream_file.close()
+            file_size = os.path.getsize(subtitle_stream_filename)
+            print(f"✓ Subtitle stream saved successfully! ({file_size} bytes)")
+        except Exception as e:
+            print(f"Warning: Error closing subtitle stream file: {e}")
+
+    if save_stream and sei_stream_file:
+        try:
+            sei_stream_file.close()
+            file_size = os.path.getsize(sei_stream_filename)
+            print(f"✓ SEI data saved successfully! ({file_size} bytes)")
+        except Exception as e:
+            print(f"Warning: Error closing SEI file: {e}")
+
 
 
     # Sort packets by wall clock time
-    packets.sort(key=lambda p: p['wall_clock'])
+    packets.sort(key=lambda p: p.wall_clock)
 
-    video_packets = [p for p in packets if p['type'] in ['I', 'P', 'B']]
-    audio_packets = [p for p in packets if p['type'] == 'A']
+    video_packets = [p for p in packets if p.type in ['I', 'P', 'B']]
+    audio_packets = [p for p in packets if p.type == 'A']
+    subtitle_packets = [p for p in packets if p.type == 'S']
 
     report_lines.append(f"Analysis duration: {actual_duration:.2f} seconds")
     report_lines.append("" * 30)
@@ -603,13 +701,13 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         report_lines.append("No frames captured.")
 
     if video_packets:
-        frame_types = [p['type'] for p in video_packets]
+        frame_types = [p.type for p in video_packets]
         frame_type_counts = Counter(frame_types)
         report_lines.append("Frame Type Distribution:")
         for f_type, count in frame_type_counts.items():
             report_lines.append(f"  - {f_type}: {count}")
 
-        timestamps = [p['timestamp'] for p in video_packets]
+        timestamps = [p.timestamp for p in video_packets]
         if len(timestamps) > 1:
             timestamp_diffs = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
             avg_timestamp_diff = sum(timestamp_diffs) / len(timestamp_diffs)
@@ -628,13 +726,13 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
             else:
                 report_lines.append("No significant timestamp gaps detected.")
             
-            drifts = [p['drift'] for p in video_packets]
+            drifts = [p.drift for p in video_packets]
             avg_drift = sum(drifts) / len(drifts)
             max_drift = max(drifts, key=abs)
             report_lines.append(f"Average wall clock drift: {avg_drift:.2f} ms")
             report_lines.append(f"Max wall clock drift: {max_drift:.2f} ms")
 
-        frame_sizes = [p['size'] for p in video_packets]
+        frame_sizes = [p.size for p in video_packets]
         avg_frame_size = sum(frame_sizes) / len(frame_sizes)
         min_frame_size = min(frame_sizes)
         max_frame_size = max(frame_sizes)
@@ -650,7 +748,7 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
             avg_pps = len(audio_packets) / actual_duration
             report_lines.append(f"Average packets per second: {avg_pps:.2f}")
         if audio_packets:
-            audio_packet_sizes = [p['size'] for p in audio_packets]
+            audio_packet_sizes = [p.size for p in audio_packets]
             avg_audio_size = sum(audio_packet_sizes) / len(audio_packet_sizes)
             min_audio_size = min(audio_packet_sizes)
             max_audio_size = max(audio_packet_sizes)
@@ -658,11 +756,19 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
             report_lines.append(f"Min packet size: {min_audio_size} bytes")
             report_lines.append(f"Max packet size: {max_audio_size} bytes")
             
-            audio_drifts = [p['drift'] for p in audio_packets]
+            audio_drifts = [p.drift for p in audio_packets]
             avg_audio_drift = sum(audio_drifts) / len(audio_drifts)
             max_audio_drift = max(audio_drifts, key=abs)
             report_lines.append(f"Average wall clock drift: {avg_audio_drift:.2f} ms")
             report_lines.append(f"Max wall clock drift: {max_audio_drift:.2f} ms")
+
+    if subtitle_stream and subtitle_packets:
+        report_lines.append("-" * 30)
+        report_lines.append("Subtitle Analysis")
+        report_lines.append(f"Total subtitle packets: {len(subtitle_packets)}")
+        if actual_duration > 0:
+            avg_sps = len(subtitle_packets) / actual_duration
+            report_lines.append(f"Average packets per second: {avg_sps:.2f}")
 
     # Add forensic corruption analysis if enabled
     if forensic_mode and corrupted_packets:
@@ -682,7 +788,7 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         }
 
         # Group errors by type
-        error_types = Counter([p['error_type'] for p in corrupted_packets])
+        error_types = Counter([p.error_type for p in corrupted_packets])
         report_lines.append("Corruption Types:")
         for error_type, count in error_types.items():
             description = error_descriptions.get(error_type, error_type)
@@ -692,12 +798,12 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         report_lines.append("")
         report_lines.append("Detailed Corruption Events:")
         for i, corrupt_pkt in enumerate(corrupted_packets[:20], 1):  # Show first 20
-            report_lines.append(f"  [{i}] Packet #{corrupt_pkt['packet_index']}")
-            report_lines.append(f"      Timestamp: {corrupt_pkt['timestamp']}")
-            report_lines.append(f"      Size: {corrupt_pkt['size']} bytes")
-            report_lines.append(f"      Frame Type: {corrupt_pkt.get('frame_type', 'Unknown')}")
-            report_lines.append(f"      Error Type: {corrupt_pkt['error_type']}")
-            report_lines.append(f"      Error: {corrupt_pkt['error'][:100]}")
+            report_lines.append(f"  [{i}] Packet #{corrupt_pkt.packet_index}")
+            report_lines.append(f"      Timestamp: {corrupt_pkt.timestamp}")
+            report_lines.append(f"      Size: {corrupt_pkt.size} bytes")
+            report_lines.append(f"      Frame Type: {corrupt_pkt.frame_type}")
+            report_lines.append(f"      Error Type: {corrupt_pkt.error_type}")
+            report_lines.append(f"      Error: {corrupt_pkt.error[:100]}")
 
         if len(corrupted_packets) > 20:
             report_lines.append(f"  ... and {len(corrupted_packets) - 20} more corrupted packets")
@@ -712,15 +818,15 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
 
             for i, corrupt_pkt in enumerate(corrupted_packets, 1):
                 f.write(f"Corrupted Packet #{i}\n")
-                f.write(f"  Packet Index: {corrupt_pkt['packet_index']}\n")
-                stream_offset = corrupt_pkt.get('stream_offset', -1)
+                f.write(f"  Packet Index: {corrupt_pkt.packet_index}\n")
+                stream_offset = corrupt_pkt.stream_offset
                 if stream_offset >= 0:
                     f.write(f"  Stream Offset: 0x{stream_offset:08x} ({stream_offset} bytes)\n")
-                f.write(f"  Timestamp (PTS): {corrupt_pkt['timestamp']}\n")
-                f.write(f"  Packet Size: {corrupt_pkt['size']} bytes\n")
-                f.write(f"  Frame Type: {corrupt_pkt.get('frame_type', 'Unknown')}\n")
-                f.write(f"  Error Type: {corrupt_pkt['error_type']}\n")
-                f.write(f"  Error Description: {corrupt_pkt['error']}\n")
+                f.write(f"  Timestamp (PTS): {corrupt_pkt.timestamp}\n")
+                f.write(f"  Packet Size: {corrupt_pkt.size} bytes\n")
+                f.write(f"  Frame Type: {corrupt_pkt.frame_type}\n")
+                f.write(f"  Error Type: {corrupt_pkt.error_type}\n")
+                f.write(f"  Error Description: {corrupt_pkt.error}\n")
                 if stream_offset >= 0:
                     f.write(f"  Hex Dump: {stream_offset:08x}.hex\n")
                     f.write(f"  Binary: {stream_offset:08x}.bin\n")
@@ -752,18 +858,21 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         for i, packet in enumerate(packets, 1):
             df_data.append({
                 'Packet': i,
-                'Type': packet['type'],
-                'Timestamp (ms)': packet['timestamp'],
-                'Wall Clock Time (ms)': packet['wall_clock'],
-                'Drift (ms)': packet['drift'],
-                'Packet Size (bytes)': packet['size']
+                'Type': packet.type,
+                'Timestamp (ms)': packet.timestamp,
+                'Wall Clock Time (ms)': packet.wall_clock,
+                'Drift (ms)': packet.drift,
+                'Packet Size (bytes)': packet.size,
+                'Has SEI': bool(getattr(packet, 'sei_metadata', '')),
+                'Subtitle': getattr(packet, 'subtitle_data', '')
             })
 
+
         # Close stream file if it was opened
-        if save_stream and stream_file:
+        if save_stream and raw_stream_file:
             try:
-                stream_file.close()
-                file_size = os.path.getsize(stream_filename)
+                raw_stream_file.close()
+                file_size = os.path.getsize(raw_stream_filename)
                 print(f"✓ Stream saved successfully! ({file_size} bytes)")
             except Exception as e:
                 print(f"Warning: Error closing stream file: {e}")
@@ -772,10 +881,10 @@ def analyze_rtsp_stream(rtsp_url, duration, output_dir, debug_log, timestamp_pre
         return pd.DataFrame(df_data), stream_output_dir
     else:
         # Close stream file if it was opened
-        if save_stream and stream_file:
+        if save_stream and raw_stream_file:
             try:
-                stream_file.close()
-                file_size = os.path.getsize(stream_filename)
+                raw_stream_file.close()
+                file_size = os.path.getsize(raw_stream_filename)
                 print(f"✓ Stream saved (no analysis data collected) ({file_size} bytes)")
             except Exception as e:
                 print(f"Warning: Error closing stream file: {e}")
